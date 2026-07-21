@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=77.0.3", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scunveil"
+version = "0.5.0"
+description = "Inference package for scUnveil single-cell embeddings and gene-expression prediction."
+readme = "README.md"
+requires-python = ">=3.9,<3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Tomáš Honzík" }
+]
+keywords = ["single-cell", "scRNA-seq", "RNA", "embeddings", "imputation"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+  "tensorflow>=2.15,<2.18",
+  "numpy>=1.23.5,<2",
+  "pandas>=2.0,<2.3",
+  "scipy>=1.10,<1.14",
+  "h5py>=3.8,<4",
+  "anndata>=0.10,<0.12",
+  "tqdm>=4.66,<5",
+  "huggingface_hub>=0.23"
+]
+
+[project.optional-dependencies]
+cuda = [
+  "tensorflow[and-cuda]>=2.15,<2.18 ; platform_system == 'Linux' and platform_machine == 'x86_64'"
+]
+test = [
+  "pytest>=8,<9",
+]
+
+[project.urls]
+Homepage = "https://github.com/thonzyk/scunveil"
+Repository = "https://github.com/thonzyk/scunveil"
+"Model weights" = "https://huggingface.co/thonzik/sc-unveil"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
