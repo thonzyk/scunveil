@@ -2,7 +2,7 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/scunveil)](https://pypi.org/project/scunveil/)
 [![Python versions](https://img.shields.io/pypi/pyversions/scunveil)](https://pypi.org/project/scunveil/)
-[![License](https://img.shields.io/pypi/l/scunveil)](LICENSE)
+[![License](https://img.shields.io/pypi/l/scunveil)](https://github.com/thonzyk/scunveil/blob/main/LICENSE)
 
 `scunveil` is the inference package for scUNVEIL, a pretrained model for
 single-cell RNA-seq measurement enrichment. It produces reusable cell
