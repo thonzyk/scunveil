@@ -26,6 +26,14 @@ NO_INPUT_ANNDATA_TEXT = 'No input AnnData is set. Run "set_input_anndata(...)" f
 MIN_MAPPING_FRACTION = 0.5
 
 
+class _UnsuitableExpressionSource(Exception):
+    """Carry a user-facing validation error while trying expression sources."""
+
+    def __init__(self, error):
+        super().__init__(str(error))
+        self.error = error
+
+
 @tf.function
 def run_tf_model_pred(tf_model, x_input):
     return tf_model(x_input, training=False)
@@ -311,12 +319,37 @@ class scUnveil:
             raise TypeError("input_anndata must be an anndata.AnnData object.")
         if input_anndata.n_obs <= 0:
             raise ValueError("input_anndata must contain at least one cell.")
-        if input_anndata.n_vars <= 0:
-            raise ValueError("input_anndata must contain at least one feature.")
-        if input_anndata.X is None:
-            raise ValueError("input_anndata.X must contain raw UMI counts.")
-        if input_anndata.X.shape != input_anndata.shape:
+        if input_anndata.X is not None and input_anndata.X.shape != input_anndata.shape:
             raise ValueError("input_anndata.X has a shape inconsistent with AnnData.")
+
+        raw = input_anndata.raw
+        if raw is not None:
+            if raw.n_obs != input_anndata.n_obs:
+                raise ValueError(
+                    "input_anndata.raw has a cell axis inconsistent with AnnData."
+                )
+            if raw.X is not None and raw.X.shape != raw.shape:
+                raise ValueError(
+                    "input_anndata.raw.X has a shape inconsistent with "
+                    "input_anndata.raw."
+                )
+
+        has_x = input_anndata.X is not None and input_anndata.n_vars > 0
+        has_raw_x = raw is not None and raw.X is not None and raw.n_vars > 0
+        if not has_x and not has_raw_x:
+            raise ValueError(
+                "Raw UMI counts must be present in input_anndata.X or "
+                "input_anndata.raw.X."
+            )
+
+    @staticmethod
+    def _expression_sources(input_anndata):
+        if input_anndata.X is not None and input_anndata.n_vars > 0:
+            yield ".X", input_anndata
+
+        raw = input_anndata.raw
+        if raw is not None and raw.X is not None and raw.n_vars > 0:
+            yield ".raw.X", raw
 
     def _require_input(self):
         if (
@@ -329,18 +362,49 @@ class scUnveil:
     def set_input_anndata(self, input_anndata, batch_size=32):
         """Validate and process raw UMI counts from an AnnData object.
 
-        The operation is transactional. If validation or model inference fails,
-        a previously processed input and its cached embeddings remain intact.
+        ``input_anndata.X`` is preferred. If it does not contain suitable raw
+        counts or compatible gene metadata, ``input_anndata.raw.X`` and its
+        paired ``input_anndata.raw.var`` are tried. The operation is
+        transactional: if validation or model inference fails, a previously
+        processed input and its cached embeddings remain intact.
         """
         batch_size = self._positive_integer(batch_size, "batch_size")
         self._validate_anndata_structure(input_anndata)
 
-        (
-            var_map_matrix,
-            raw_embeddings,
-            pca_embeddings,
-            mapping_summary,
-        ) = self._process_anndata(input_anndata, batch_size=batch_size)
+        rejected_sources = []
+        for expression_source, expression_data in self._expression_sources(
+            input_anndata
+        ):
+            try:
+                (
+                    var_map_matrix,
+                    raw_embeddings,
+                    pca_embeddings,
+                    mapping_summary,
+                ) = self._process_anndata(
+                    expression_data,
+                    batch_size=batch_size,
+                    expression_source=expression_source,
+                )
+            except _UnsuitableExpressionSource as exc:
+                rejected_sources.append((expression_source, exc.error))
+                continue
+            break
+        else:
+            if len(rejected_sources) == 1:
+                raise rejected_sources[0][1]
+
+            details = "\n".join(
+                f"input_anndata{source}: {error}"
+                for source, error in rejected_sources
+            )
+            raise ValueError(
+                "Neither input_anndata.X nor input_anndata.raw.X contains "
+                "suitable raw UMI counts with compatible gene metadata:\n"
+                f"{details}"
+            )
+
+        mapping_summary["expression_source"] = expression_source
 
         # Commit the new state only after every validation and inference batch
         # has completed successfully.
@@ -351,13 +415,20 @@ class scUnveil:
         self.pca_embeddings = pca_embeddings
         self.gene_mapping_summary = mapping_summary
 
-    def _process_anndata(self, input_anndata, batch_size):
-        var_map_matrix, mapping_summary = self._calculate_gene_sort(input_anndata)
+    def _process_anndata(self, expression_data, batch_size, expression_source=".X"):
+        try:
+            var_map_matrix, mapping_summary = self._calculate_gene_sort(
+                expression_data
+            )
+        except (TypeError, ValueError) as exc:
+            raise _UnsuitableExpressionSource(exc) from exc
+
         raw_embeddings, pca_embeddings, mapped_umi_fraction = (
             self._calculate_embeddings(
-                input_anndata,
+                expression_data,
                 var_map_matrix,
                 batch_size,
+                expression_source,
             )
         )
 
@@ -366,13 +437,14 @@ class scUnveil:
             mapped_umi_fraction is not None
             and mapped_umi_fraction < MIN_MAPPING_FRACTION
         ):
-            raise ValueError(
+            error = ValueError(
                 "Only "
                 f"{mapped_umi_fraction:.1%} of input UMI counts map to the "
-                "scUNVEIL gene vocabulary. Ensure that .X contains raw human "
-                "UMI counts and .var contains compatible human gene symbols "
-                "or Ensembl IDs."
+                "scUNVEIL gene vocabulary. Ensure that the selected expression "
+                "matrix contains raw human UMI counts and its matching feature "
+                "metadata contains compatible human gene symbols or Ensembl IDs."
             )
+            raise _UnsuitableExpressionSource(error) from error
 
         self._message(
             "Mapped "
@@ -515,25 +587,26 @@ class scUnveil:
         return var_map_matrix, mapping_summary
 
     @staticmethod
-    def _validated_count_batch(batch):
+    def _validated_count_batch(batch, expression_source=".X"):
+        source_name = f"input_anndata{expression_source}"
         if issparse(batch):
             batch = batch.tocsr(copy=True)
             batch.sum_duplicates()
             values = batch.data
             if batch.dtype.kind in {"O", "S", "U", "c", "b"}:
-                raise TypeError("input_anndata.X must contain numeric UMI counts.")
+                raise TypeError(f"{source_name} must contain numeric UMI counts.")
         else:
             try:
                 dense = np.asarray(batch)
             except Exception as exc:
                 raise TypeError(
-                    "input_anndata.X must be a NumPy-like dense matrix or a "
+                    f"{source_name} must be a NumPy-like dense matrix or a "
                     "SciPy-compatible sparse matrix."
                 ) from exc
             if dense.ndim != 2:
                 raise ValueError("Every input expression batch must be 2D.")
             if dense.dtype.kind in {"O", "S", "U", "c", "b"}:
-                raise TypeError("input_anndata.X must contain numeric UMI counts.")
+                raise TypeError(f"{source_name} must contain numeric UMI counts.")
             values = dense.ravel()
             batch = csr_matrix(dense)
 
@@ -542,15 +615,15 @@ class scUnveil:
                 finite = np.isfinite(values)
             except TypeError as exc:
                 raise TypeError(
-                    "input_anndata.X must contain numeric UMI counts."
+                    f"{source_name} must contain numeric UMI counts."
                 ) from exc
             if not finite.all():
-                raise ValueError("input_anndata.X contains NaN or infinite values.")
+                raise ValueError(f"{source_name} contains NaN or infinite values.")
             if np.any(values < 0):
-                raise ValueError("input_anndata.X contains negative values.")
+                raise ValueError(f"{source_name} contains negative values.")
             if not np.equal(values, np.floor(values)).all():
                 raise ValueError(
-                    "input_anndata.X must contain raw integer-like UMI counts. "
+                    f"{source_name} must contain raw integer-like UMI counts. "
                     "Normalized or log-transformed expression is not a valid "
                     "scUNVEIL input."
                 )
@@ -562,6 +635,7 @@ class scUnveil:
         input_anndata,
         var_map_matrix,
         batch_size,
+        expression_source=".X",
     ):
         self._message("Processing cells...")
         n_cells = input_anndata.n_obs
@@ -583,10 +657,16 @@ class scUnveil:
                     count_batch = input_anndata.X[start:end]
                 except Exception as exc:
                     raise RuntimeError(
-                        f"Could not read cells {start}:{end} from AnnData.X."
+                        f"Could not read cells {start}:{end} from "
+                        f"input_anndata{expression_source}."
                     ) from exc
 
-                count_batch = self._validated_count_batch(count_batch)
+                try:
+                    count_batch = self._validated_count_batch(
+                        count_batch, expression_source
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise _UnsuitableExpressionSource(exc) from exc
                 mapped_batch = count_batch @ var_map_matrix
 
                 total_umis += float(count_batch.sum(dtype=np.float64))
