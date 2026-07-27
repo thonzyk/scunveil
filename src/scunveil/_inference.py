@@ -231,7 +231,10 @@ class scUnveil:
                 value, (bool, np.bool_)
             ):
                 raise RuntimeError(f"config.{name} must be an integer.")
-            if value <= 0:
+            if name == "n_layers":
+                if value < 0:
+                    raise RuntimeError("config.n_layers must be non-negative.")
+            elif value <= 0:
                 raise RuntimeError(f"config.{name} must be positive.")
 
         required_columns = {"feature_id", "feature_name"}
