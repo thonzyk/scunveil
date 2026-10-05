@@ -1,7 +1,12 @@
+from __future__ import annotations
+
 import json
 import re
+import warnings
+from math import prod
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Iterable, Optional, Union
 
 import anndata as ad
 import numpy as np
@@ -13,17 +18,18 @@ from tqdm import tqdm
 
 from ._data_operations import logits_to_CPM, simple_scipy_norm_x
 from ._layers import PCAProjection
-from ._model import RNABagModel
+from ._model import RNABagModel, TiedOutput
+from ._result import ScUnveilResult
 
 
 SCUNVEIL_MODEL_REPO = "thonzik/sc-unveil"
-STABLE_VERSION_FILE = "models/stable_version.txt"
-NO_INPUT_ANNDATA_TEXT = 'No input AnnData is set. Run "set_input_anndata(...)" first.'
+DEFAULT_MODEL_VERSION = "2026-10-02_11-54-21_w64"
 
 # scUNVEIL covers nearly the complete human reference. Mapping less than half
 # of the supplied features or UMI mass almost always indicates a wrong
 # identifier column, a non-human input, or incompatible annotation.
 MIN_MAPPING_FRACTION = 0.5
+LARGE_ALLOCATION_BYTES = 1024**3
 
 
 class _UnsuitableExpressionSource(Exception):
@@ -46,44 +52,22 @@ class scUnveil:
     ----------
     model_version : str or None, default=None
         Checkpoint version stored in the scUNVEIL Hugging Face repository.
-        ``None`` selects the version named in ``models/stable_version.txt``.
+        ``None`` selects the default version bundled with this package.
 
     verbose : bool, default=True
         Show model-loading messages and progress bars.
     """
 
-    def __init__(self, model_version=None, verbose=True):
+    def __init__(self, model_version: Optional[str] = None, verbose: bool = True) -> None:
         if not isinstance(verbose, (bool, np.bool_)):
             raise TypeError("verbose must be a boolean.")
 
         self.verbose = bool(verbose)
-        self.input_anndata = None
-        self.raw_embeddings = None
-        self.pca_embeddings = None
-        self.var_map_matrix = None
-        self.gene_mapping_summary = None
-        self._input_obs = None
 
         self._message("Model initialization...")
 
         if model_version is None:
-            checkpoint_path = snapshot_download(
-                repo_id=SCUNVEIL_MODEL_REPO,
-                repo_type="model",
-                allow_patterns=[STABLE_VERSION_FILE],
-            )
-            stable_version_path = Path(checkpoint_path) / STABLE_VERSION_FILE
-            try:
-                model_version = (
-                    stable_version_path.read_text(encoding="utf-8")
-                    .splitlines()[0]
-                    .strip()
-                )
-            except (OSError, IndexError) as exc:
-                raise RuntimeError(
-                    "Could not read the stable scUNVEIL model version from "
-                    f"{stable_version_path}."
-                ) from exc
+            model_version = DEFAULT_MODEL_VERSION
 
         if not isinstance(model_version, str) or not model_version.strip():
             raise ValueError("model_version must be a non-empty string or None.")
@@ -149,21 +133,21 @@ class scUnveil:
             n_vars=self.config.n_genes,
             n_layers=self.config.n_layers,
             emb_dim=self.config.emb_dim,
+            ff_dim=config.get('ff_dim'),
         )
         self._message("Loading weights...")
         model.model.load_weights(required_paths["weights"])
 
         self.full_model = model.model
-        self.output_layer = model.model.layers[-1]
-
-        if not isinstance(self.output_layer, tf.keras.layers.Dense):
-            raise RuntimeError("The checkpoint model does not end in a Dense layer.")
-        if self.output_layer.units != self.config.n_genes:
+        self.output_layer = model.model.get_layer('out_logits')
+        if not isinstance(self.output_layer, TiedOutput):
+            raise RuntimeError("The checkpoint model does not end in a tied output layer.")
+        if int(model.model.output_shape[-1]) != self.config.n_genes:
             raise RuntimeError(
                 "The checkpoint output layer does not match config.n_genes."
             )
 
-        embedding_output = model.model.layers[-2].output
+        embedding_output = model.model.get_layer('out_emb').output
         if int(embedding_output.shape[-1]) != self.config.emb_dim:
             raise RuntimeError(
                 "The checkpoint embedding layer does not match config.emb_dim."
@@ -203,6 +187,18 @@ class scUnveil:
     def _message(self, message):
         if self.verbose:
             print(message)
+
+    @staticmethod
+    def _warn_large_allocation(description, shape, dtype):
+        size = prod(shape) * np.dtype(dtype).itemsize
+        if size >= LARGE_ALLOCATION_BYTES:
+            warnings.warn(
+                f"{description}: largest expected single allocation is "
+                f"approximately {size / 1024**3:.1f} GiB. Actual peak memory "
+                "may be higher.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     @staticmethod
     def _positive_integer(value, name):
@@ -354,22 +350,15 @@ class scUnveil:
         if raw is not None and raw.X is not None and raw.n_vars > 0:
             yield ".raw.X", raw
 
-    def _require_input(self):
-        if (
-            self.input_anndata is None
-            or self.raw_embeddings is None
-            or self.pca_embeddings is None
-        ):
-            raise RuntimeError(NO_INPUT_ANNDATA_TEXT)
-
-    def set_input_anndata(self, input_anndata, batch_size=32):
-        """Validate and process raw UMI counts from an AnnData object.
+    def process_anndata(
+        self, input_anndata: ad.AnnData, batch_size: int = 32
+    ) -> ScUnveilResult:
+        """Process raw UMI counts and return an independent dataset result.
 
         ``input_anndata.X`` is preferred. If it does not contain suitable raw
         counts or compatible gene metadata, ``input_anndata.raw.X`` and its
-        paired ``input_anndata.raw.var`` are tried. The operation is
-        transactional: if validation or model inference fails, a previously
-        processed input and its cached embeddings remain intact.
+        paired ``input_anndata.raw.var`` are tried. Failed processing leaves
+        any previously returned results untouched.
         """
         batch_size = self._positive_integer(batch_size, "batch_size")
         self._validate_anndata_structure(input_anndata)
@@ -409,37 +398,54 @@ class scUnveil:
 
         mapping_summary["expression_source"] = expression_source
 
-        # Commit the new state only after every validation and inference batch
-        # has completed successfully.
-        self.input_anndata = input_anndata
-        self._input_obs = input_anndata.obs.copy()
-        self.var_map_matrix = var_map_matrix
-        self.raw_embeddings = raw_embeddings
-        self.pca_embeddings = pca_embeddings
-        self.gene_mapping_summary = mapping_summary
+        return ScUnveilResult(
+            sc_unveil=self,
+            input_anndata=input_anndata,
+            var_map_matrix=var_map_matrix,
+            raw_embeddings=raw_embeddings,
+            pca_embeddings=pca_embeddings,
+            gene_mapping_summary=mapping_summary,
+        )
 
     def _process_anndata(self, expression_data, batch_size, expression_source=".X"):
         try:
-            var_map_matrix, mapping_summary = self._calculate_gene_sort(
-                expression_data
-            )
+            candidates = self._detect_gene_column(expression_data)
         except (TypeError, ValueError) as exc:
             raise _UnsuitableExpressionSource(exc) from exc
 
-        raw_embeddings, pca_embeddings, mapped_umi_fraction = (
-            self._calculate_embeddings(
-                expression_data,
-                var_map_matrix,
-                batch_size,
-                expression_source,
+        self._message("Mapping gene permutation...")
+        first_error = None
+        seen_mappings = set()
+        mapped_umi_fraction = None
+        for detection in candidates:
+            signature = (
+                tuple(detection["input_indices"]),
+                tuple(detection["reference_indices"]),
             )
-        )
-
-        mapping_summary["mapped_umi_fraction"] = mapped_umi_fraction
-        if (
-            mapped_umi_fraction is not None
-            and mapped_umi_fraction < MIN_MAPPING_FRACTION
-        ):
+            if signature in seen_mappings:
+                continue
+            seen_mappings.add(signature)
+            try:
+                var_map_matrix, mapping_summary = self._calculate_gene_sort(
+                    expression_data, detection
+                )
+            except ValueError as exc:
+                if first_error is None:
+                    first_error = exc
+                continue
+            raw_embeddings, pca_embeddings, mapped_umi_fraction = (
+                self._calculate_embeddings(
+                    expression_data,
+                    var_map_matrix,
+                    batch_size,
+                    expression_source,
+                )
+            )
+            if mapped_umi_fraction is None or mapped_umi_fraction >= MIN_MAPPING_FRACTION:
+                break
+        else:
+            if mapped_umi_fraction is None:
+                raise _UnsuitableExpressionSource(first_error) from first_error
             error = ValueError(
                 "Only "
                 f"{mapped_umi_fraction:.1%} of input UMI counts map to the "
@@ -448,6 +454,8 @@ class scUnveil:
                 "metadata contains compatible human gene symbols or Ensembl IDs."
             )
             raise _UnsuitableExpressionSource(error) from error
+
+        mapping_summary["mapped_umi_fraction"] = mapped_umi_fraction
 
         self._message(
             "Mapped "
@@ -475,8 +483,8 @@ class scUnveil:
                 yield str(column), values
 
     def _detect_gene_column(self, input_anndata):
-        """Find the input identifier source with the best full-vocabulary map."""
-        best = None
+        """Rank input identifier sources by full-vocabulary coverage."""
+        candidates = []
 
         for column, values in self._candidate_identifiers(input_anndata):
             raw_values = list(values)
@@ -518,10 +526,10 @@ class scUnveil:
                     "ambiguous_values": ambiguous_values,
                     "score": score,
                 }
-                if best is None or score > best["score"]:
-                    best = result
+                if input_indices:
+                    candidates.append(result)
 
-        if best is None or not best["input_indices"]:
+        if not candidates:
             raise ValueError(
                 "Could not find compatible human gene identifiers in "
                 "input_anndata.var. Put gene symbols (for example TP53 or "
@@ -529,12 +537,11 @@ class scUnveil:
                 ".var index or a .var column."
             )
 
-        return best
+        return sorted(
+            candidates, key=lambda candidate: candidate["score"], reverse=True
+        )
 
-    def _calculate_gene_sort(self, input_anndata):
-        self._message("Mapping gene permutation...")
-        detection = self._detect_gene_column(input_anndata)
-
+    def _calculate_gene_sort(self, input_anndata, detection):
         input_indices = np.asarray(detection["input_indices"], dtype=np.int64)
         reference_indices = np.asarray(detection["reference_indices"], dtype=np.int64)
 
@@ -642,6 +649,13 @@ class scUnveil:
     ):
         self._message("Processing cells...")
         n_cells = input_anndata.n_obs
+        largest_bytes = max(
+            n_cells * self.config.emb_dim * np.dtype(np.float16).itemsize,
+            min(n_cells, batch_size) * self.config.n_genes * np.dtype(np.float32).itemsize,
+            min(n_cells, batch_size) * input_anndata.n_vars
+            * np.dtype(input_anndata.X.dtype).itemsize,
+        )
+        self._warn_large_allocation("Processing cells", (largest_bytes,), np.uint8)
         raw_embeddings = np.zeros((n_cells, self.config.emb_dim), dtype=np.float16)
         pca_embeddings = np.zeros((n_cells, self.config.emb_dim), dtype=np.float16)
 
@@ -710,72 +724,12 @@ class scUnveil:
             model_var.index = pd.Index(feature_ids, name=None)
         return model_var
 
-    def get_raw_embeddings(self):
-        """Return the unrotated 2,048-dimensional model embeddings."""
-        self._require_input()
-        return self.raw_embeddings.copy()
-
-    def get_embeddings(self, n_features=512):
-        """Return PCA-ordered cell embeddings.
-
-        ``None`` returns all PCA components. A positive integer returns that
-        many leading components. Use :meth:`get_raw_embeddings` for the
-        unrotated hidden state.
-        """
-        self._require_input()
-        if n_features is None:
-            return self.pca_embeddings.copy()
-
-        n_features = self._positive_integer(n_features, "n_features")
-        if n_features > self.config.emb_dim:
-            raise ValueError(
-                "n_features cannot exceed the model embedding dimension "
-                f"({self.config.emb_dim})."
-            )
-        return self.pca_embeddings[:, :n_features].copy()
-
     def _predict_log10_cpm(self, raw_embeddings):
         prediction = run_tf_model_pred(self.expression_predictor, raw_embeddings)
         prediction = logits_to_CPM(prediction)
         if not np.isfinite(prediction).all():
             raise FloatingPointError("The model produced non-finite log10(CPM) values.")
         return prediction
-
-    def get_all_genes_imputation(self, batch_size=128):
-        """Return imputed expression for all model genes as log10(CPM)."""
-        self._require_input()
-        batch_size = self._positive_integer(batch_size, "batch_size")
-
-        n_cells = self.raw_embeddings.shape[0]
-        output_gib = (n_cells * self.config.n_genes * np.dtype(np.float16).itemsize) / (
-            1024**3
-        )
-        if output_gib >= 1:
-            self._message(
-                "Allocating approximately "
-                f"{output_gib:.1f} GiB for all-gene imputation. Use "
-                "get_specific_genes_imputation for a smaller result."
-            )
-
-        gene_expressions = np.zeros((n_cells, self.config.n_genes), dtype=np.float16)
-        with tqdm(
-            total=n_cells,
-            disable=not self.verbose,
-            desc="scUNVEIL imputation",
-            unit="cell",
-        ) as progress:
-            for start in range(0, n_cells, batch_size):
-                raw_batch = self.raw_embeddings[start : start + batch_size]
-                prediction = self._predict_log10_cpm(raw_batch)
-                n_batch = raw_batch.shape[0]
-                gene_expressions[start : start + n_batch] = prediction
-                progress.update(n_batch)
-
-        return ad.AnnData(
-            X=gene_expressions,
-            obs=self._input_obs.copy(),
-            var=self._model_var(),
-        )
 
     def _resolve_requested_genes(self, list_of_gene_names):
         if isinstance(list_of_gene_names, str):
@@ -844,50 +798,25 @@ class scUnveil:
 
         return requested_genes, np.asarray(gene_indices, dtype=np.int64)
 
-    def get_specific_genes_imputation(self, list_of_gene_names, batch_size=128):
-        """Return selected-gene imputation in request order as log10(CPM)."""
-        self._require_input()
-        batch_size = self._positive_integer(batch_size, "batch_size")
-        _, gene_indices = self._resolve_requested_genes(list_of_gene_names)
-
-        n_cells = self.raw_embeddings.shape[0]
-        gene_expressions = np.zeros((n_cells, len(gene_indices)), dtype=np.float16)
-        with tqdm(
-            total=n_cells,
-            disable=not self.verbose,
-            desc="scUNVEIL imputation",
-            unit="cell",
-        ) as progress:
-            for start in range(0, n_cells, batch_size):
-                raw_batch = self.raw_embeddings[start : start + batch_size]
-                prediction = self._predict_log10_cpm(raw_batch)
-                selected_prediction = prediction[:, gene_indices]
-                n_batch = raw_batch.shape[0]
-                gene_expressions[start : start + n_batch] = selected_prediction
-                progress.update(n_batch)
-
-        return ad.AnnData(
-            X=gene_expressions,
-            obs=self._input_obs.copy(),
-            var=self._model_var(gene_indices),
-        )
-
     def _gene_embedding_array(self, normalize=True, indices=None):
         if not isinstance(normalize, (bool, np.bool_)):
             raise TypeError("normalize must be a boolean.")
 
-        kernel = tf.cast(self.output_layer.kernel, tf.float32)
+        self._warn_large_allocation(
+            "Gene embeddings", (self.config.n_genes, self.config.emb_dim), np.float32
+        )
+        gene_matrix = tf.cast(self.output_layer.input_projection.kernel, tf.float32)
         scale = None
         if normalize:
-            # Always scale against the complete decoder matrix. A selected
-            # subset must equal the same rows from get_genes_embeddings().
-            scale = tf.math.reduce_std(kernel)
+            # Scale against the complete gene matrix, including when selecting
+            # a subset, so selected rows match get_genes_embeddings().
+            scale = tf.math.reduce_std(gene_matrix)
 
         if indices is None:
-            gene_embeddings = tf.transpose(kernel)
+            gene_embeddings = gene_matrix
         else:
             indices = tf.convert_to_tensor(indices, dtype=tf.int32)
-            gene_embeddings = tf.transpose(tf.gather(kernel, indices, axis=1))
+            gene_embeddings = tf.gather(gene_matrix, indices, axis=0)
 
         if normalize:
             gene_embeddings = gene_embeddings / tf.maximum(scale, 1e-9)
@@ -897,8 +826,8 @@ class scUnveil:
             raise FloatingPointError("Gene embeddings contain non-finite values.")
         return result.astype(np.float16)
 
-    def get_genes_embeddings(self, normalize=True):
-        """Return output-decoder gene embeddings.
+    def get_genes_embeddings(self, normalize: bool = True) -> ad.AnnData:
+        """Return the shared input/output gene embeddings.
 
         Rows correspond to model genes and columns to the cell-embedding space.
         With ``normalize=True``, the complete matrix is scaled by its global
@@ -910,14 +839,69 @@ class scUnveil:
             obs=self._model_var(),
         )
 
+    def get_model_clone_for_finetuning(
+        self,
+        output_dim: int,
+        list_of_input_genes: Optional[Union[str, Iterable[str]]] = None,
+    ) -> tf.keras.Model:
+        """Return an independent Keras model with a trainable residual head.
+
+        Input columns are raw UMI counts in ``list_of_input_genes`` order, or
+        full model order when no list is supplied. The cloned backbone ends at
+        ``out_emb``; its gene-output and PCA projections are excluded.
+        """
+        output_dim = self._positive_integer(output_dim, "output_dim")
+        gene_indices = None
+        if list_of_input_genes is not None:
+            _, gene_indices = self._resolve_requested_genes(list_of_input_genes)
+        input_dim = self.config.n_genes if gene_indices is None else len(gene_indices)
+        self._warn_large_allocation(
+            "Fine-tuning model clone", (input_dim, self.config.emb_dim), np.float32
+        )
+
+        backbone = tf.keras.models.clone_model(
+            self.raw_embedder,
+            input_tensors=tf.keras.Input(shape=(input_dim,)),
+        )
+        for source_layer in self.raw_embedder.layers:
+            if not source_layer.weights:
+                continue
+            target_layer = backbone.get_layer(source_layer.name)
+            if (
+                source_layer is self.output_layer.input_projection
+                and gene_indices is not None
+            ):
+                target_layer.kernel.assign(tf.gather(source_layer.kernel, gene_indices))
+            else:
+                for source_weight, target_weight in zip(
+                    source_layer.weights, target_layer.weights
+                ):
+                    target_weight.assign(source_weight)
+
+        raw_counts = tf.keras.Input(shape=(input_dim,), name="raw_umi_counts")
+        embedding = backbone(tf.keras.ops.log1p(raw_counts))
+        branch = tf.keras.layers.LayerNormalization(epsilon=1e-6)(embedding)
+        branch = tf.keras.layers.Dense(self.config.emb_dim * 4, activation="relu")(
+            branch
+        )
+        branch = tf.keras.layers.Dense(
+            self.config.emb_dim, kernel_initializer="zeros"
+        )(branch)
+        adapted = tf.keras.layers.Add()([embedding, branch])
+        output = tf.keras.layers.Dense(output_dim)(adapted)
+        return tf.keras.Model(raw_counts, output, name="scunveil_finetuning")
+
     def generate_cells(
         self,
-        n_cells,
-        sampling_depth,
-        batch_size=128,
-        seed=None,
-    ):
-        """Generate count vectors by autoregressive next-UMI sampling."""
+        n_cells: int,
+        sampling_depth: int,
+        batch_size: int = 128,
+        seed: Optional[int] = None,
+    ) -> ad.AnnData:
+        """Generate count vectors by autoregressive next-UMI sampling.
+
+        Seeded results are reproducible for the same seed and batch size.
+        """
         n_cells = self._positive_integer(n_cells, "n_cells")
         sampling_depth = self._positive_integer(sampling_depth, "sampling_depth")
         batch_size = self._positive_integer(batch_size, "batch_size")
@@ -927,7 +911,13 @@ class scUnveil:
             ):
                 raise TypeError("seed must be an integer or None.")
             seed = int(seed) % (2**31 - 1)
+            self._message(
+                "Seeded generation is reproducible for the same seed and batch size."
+            )
 
+        self._warn_large_allocation(
+            "Generating cells", (n_cells, self.config.n_genes), np.float32
+        )
         cells = tf.zeros((n_cells, self.config.n_genes), dtype=tf.float32)
         random_call = 0
 
@@ -981,52 +971,3 @@ class scUnveil:
             X=csr_matrix(cells.numpy()),
             var=self._model_var(),
         )
-
-    def get_fully_enriched_h5ad(
-        self,
-        batch_size=128,
-        list_of_genes=None,
-        n_embedding_features=None,
-    ):
-        """Return imputation, cell embeddings, and output gene embeddings."""
-        self._require_input()
-        batch_size = self._positive_integer(batch_size, "batch_size")
-
-        if n_embedding_features is not None:
-            n_embedding_features = self._positive_integer(
-                n_embedding_features, "n_embedding_features"
-            )
-            if n_embedding_features > self.config.emb_dim:
-                raise ValueError(
-                    "n_embedding_features cannot exceed the model embedding "
-                    f"dimension ({self.config.emb_dim})."
-                )
-
-        if list_of_genes is None:
-            enriched = self.get_all_genes_imputation(batch_size=batch_size)
-            gene_indices = np.arange(self.config.n_genes, dtype=np.int64)
-        else:
-            _, gene_indices = self._resolve_requested_genes(list_of_genes)
-            enriched = self.get_specific_genes_imputation(
-                list_of_gene_names=list_of_genes,
-                batch_size=batch_size,
-            )
-
-        cell_embeddings = self.get_embeddings(n_features=n_embedding_features)
-        gene_embeddings = self._gene_embedding_array(
-            normalize=True,
-            indices=gene_indices,
-        )
-
-        if cell_embeddings.shape[0] != enriched.n_obs:
-            raise RuntimeError(
-                "Cell count mismatch between imputation and cell embeddings."
-            )
-        if gene_embeddings.shape[0] != enriched.n_vars:
-            raise RuntimeError(
-                "Gene count mismatch between imputation and gene embeddings."
-            )
-
-        enriched.obsm["X_scunveil"] = cell_embeddings.copy()
-        enriched.varm["scunveil_gene_embeddings"] = gene_embeddings.copy()
-        return enriched

@@ -52,7 +52,19 @@ tar -tzf dist/*.tar.gz
 
 
 # ============================================================
-# 6. Optional TestPyPI upload
+# 6. Check the built wheel against the public default checkpoint
+# ============================================================
+
+REPO_ROOT="$PWD"
+python3.11 -m venv /tmp/scunveil-release-smoke
+/tmp/scunveil-release-smoke/bin/python -m pip install dist/*.whl pytest
+(cd /tmp && CUDA_VISIBLE_DEVICES=-1 SCUNVEIL_RUN_RELEASE_SMOKE=1 \
+  /tmp/scunveil-release-smoke/bin/python -I -m pytest -q \
+  "$REPO_ROOT/tests/test_release_smoke.py")
+
+
+# ============================================================
+# 7. Optional TestPyPI upload
 # ============================================================
 
 # This validates authentication and metadata without consuming the release
@@ -62,7 +74,7 @@ tar -tzf dist/*.tar.gz
 
 
 # ============================================================
-# 7. Upload to the real PyPI registry
+# 8. Upload to the real PyPI registry
 # ============================================================
 
 # Review the exact filenames and version one final time before running:
@@ -74,7 +86,7 @@ tar -tzf dist/*.tar.gz
 
 
 # ============================================================
-# 8. Leave the publishing environment
+# 9. Leave the publishing environment
 # ============================================================
 
 deactivate

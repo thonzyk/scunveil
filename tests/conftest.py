@@ -10,6 +10,7 @@ import tensorflow as tf
 
 from scunveil._inference import scUnveil
 from scunveil._layers import PCAProjection
+from scunveil._model import RNABagModel
 
 
 def make_test_model(n_genes=8, emb_dim=4, reference_var=None):
@@ -34,22 +35,12 @@ def make_test_model(n_genes=8, emb_dim=4, reference_var=None):
     model.reference_var = reference_var.reset_index(drop=True)
     model._build_reference_lookups()
 
-    inputs = tf.keras.Input(shape=(n_genes,))
-    embeddings = tf.keras.layers.Dense(
-        emb_dim,
-        kernel_initializer=tf.keras.initializers.GlorotUniform(seed=11),
-        bias_initializer="zeros",
-    )(inputs)
-    embeddings = tf.keras.layers.LayerNormalization()(embeddings)
-    outputs = tf.keras.layers.Dense(
-        n_genes,
-        kernel_initializer=tf.keras.initializers.GlorotUniform(seed=13),
-        bias_initializer="zeros",
-    )(embeddings)
-
-    model.full_model = tf.keras.Model(inputs=inputs, outputs=outputs)
-    model.raw_embedder = tf.keras.Model(inputs=inputs, outputs=embeddings)
-    model.output_layer = model.full_model.layers[-1]
+    model.full_model = RNABagModel(n_vars=n_genes, n_layers=1, emb_dim=emb_dim).model
+    model.raw_embedder = tf.keras.Model(
+        model.full_model.input,
+        model.full_model.get_layer('out_emb').output,
+    )
+    model.output_layer = model.full_model.get_layer('out_logits')
     model.expression_predictor = tf.keras.Sequential([model.output_layer])
 
     model.pca_mean = np.zeros((1, emb_dim), dtype=np.float32)
@@ -58,12 +49,6 @@ def make_test_model(n_genes=8, emb_dim=4, reference_var=None):
     model.pca_projector.build((None, emb_dim))
     model.pca_projector.set_weights([model.pca_mean, model.pca_mat])
 
-    model.input_anndata = None
-    model.raw_embeddings = None
-    model.pca_embeddings = None
-    model.var_map_matrix = None
-    model.gene_mapping_summary = None
-    model._input_obs = None
     return model
 
 

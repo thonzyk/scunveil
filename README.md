@@ -15,7 +15,7 @@ dataset-specific training during inference.
 
 ## Installation
 
-scUNVEIL supports Python 3.9 through 3.11.
+scUNVEIL supports Python 3.9 through 3.12.
 
 ```bash
 python -m pip install scunveil
@@ -35,7 +35,7 @@ initializations reuse the Hugging Face cache.
 
 ## Input requirements
 
-`set_input_anndata` accepts an `anndata.AnnData` containing raw, nonnegative,
+`process_anndata` accepts an `anndata.AnnData` containing raw, nonnegative,
 integer-like UMI counts in `.X`. Dense NumPy arrays, SciPy sparse matrices, and
 backed sparse H5AD matrices are supported.
 
@@ -57,7 +57,7 @@ the model vocabulary. Ambiguous symbols are not assigned arbitrarily; use their
 Ensembl IDs instead. Mapping information is available after processing:
 
 ```python
-print(model.gene_mapping_summary)
+print(result.gene_mapping_summary)
 ```
 
 ## Basic usage
@@ -68,40 +68,51 @@ from scunveil import scUnveil
 
 adata = ad.read_h5ad("my_raw_counts.h5ad")
 
-model = scUnveil()
-model.set_input_anndata(adata, batch_size=256)
+scu_model = scUnveil()
+result = scu_model.process_anndata(adata, batch_size=256)
 
 # Leading PCA-ordered components, shape: (cells, 512)
-embeddings = model.get_embeddings(n_features=512)
+embeddings = result.get_embeddings(n_features=512)
 
 # Selected-gene depth-enriched expression
-markers = model.get_specific_genes_imputation(
+markers = result.get_specific_genes_imputation(
     ["CD4", "CD8A", "ENSG00000163599"],
     batch_size=256,
 )
 ```
 
+`process_anndata` returns a `ScUnveilResult` for that dataset. Results retain a
+reference to their originating model and input `AnnData`; processing another
+dataset produces a separate result without changing existing ones. The input
+is not copied. Keep a backed H5AD file open if you need to access it through
+`result.input_anndata` later.
+
+```python
+other_result = scu_model.process_anndata(other_adata)
+assert result.sc_unveil is other_result.sc_unveil is scu_model
+```
+
 Pass `verbose=False` to suppress package messages and progress bars:
 
 ```python
-model = scUnveil(verbose=False)
+scu_model = scUnveil(verbose=False)
 ```
 
 An explicit checkpoint can be selected with
-`scUnveil(model_version="VERSION")`. The default follows
-`models/stable_version.txt` in the model repository.
+`scUnveil(model_version="VERSION")`. The default model version is selected by
+this package release.
 
 ## Cell embeddings
 
 ```python
 # Default: the leading 512 PCA components
-x_512 = model.get_embeddings()
+x_512 = result.get_embeddings()
 
 # All 2048 PCA components
-x_pca_full = model.get_embeddings(n_features=None)
+x_pca_full = result.get_embeddings(n_features=None)
 
 # Original, unrotated 2048-dimensional hidden state
-x_raw = model.get_raw_embeddings()
+x_raw = result.get_raw_embeddings()
 ```
 
 The PCA projection was fitted after pretraining so that the leading columns are
@@ -111,8 +122,8 @@ embedding space; truncation selects its leading components.
 ## Expression imputation
 
 ```python
-selected = model.get_specific_genes_imputation(["CD4", "CD8A"])
-all_genes = model.get_all_genes_imputation()
+selected = result.get_specific_genes_imputation(["CD4", "CD8A"])
+all_genes = result.get_all_genes_imputation()
 ```
 
 Both methods return an `AnnData`. Its `.X` contains:
@@ -137,22 +148,43 @@ Use selected-gene imputation when the complete matrix is unnecessary.
 ## Gene embeddings
 
 ```python
-gene_embeddings = model.get_genes_embeddings(normalize=True)
+gene_embeddings = scu_model.get_genes_embeddings(normalize=True)
 ```
 
-This returns an `AnnData` with genes in `.obs` and decoder embeddings in `.X`.
-For output gene `g`, its vector is the corresponding column of the final output
-kernel, transposed into `(n_genes, embedding_dimension)` form. It describes how
-directions in cell-embedding space change that gene's predicted logit.
+This returns an `AnnData` with genes in `.obs` and shared gene embeddings in
+`.X`, shaped `(n_genes, embedding_dimension)`. The same matrix reads observed
+genes into the model and scores genes from cell embeddings.
 
 With `normalize=True`, the complete matrix is divided by its global standard
-deviation. Relative vector lengths and cosine relationships are preserved. The
-decoder bias is not included in the embedding vectors.
+deviation. Relative vector lengths and cosine relationships are preserved.
+
+## Fine-tuning model
+
+```python
+input_genes = adata.var["feature_id"].tolist()
+finetuning_model = scu_model.get_model_clone_for_finetuning(
+    output_dim=3,
+    list_of_input_genes=input_genes,
+)
+```
+
+This returns a separate, trainable Keras model. It copies the pretrained
+backbone through the final cell embedding, selects and orders the initial gene
+projection according to `input_genes`, then adds a residual block with a
+zero-initialized final branch and a linear `output_dim` head. Training the clone
+does not change `scu_model`. Gene names and Ensembl IDs are accepted; unknown,
+ambiguous, or duplicate mappings raise an error.
+
+The returned Keras model takes **raw UMI counts** with columns in `input_genes`
+order and applies `log1p` internally. It does not accept an `AnnData` object
+directly. Omitting `list_of_input_genes` uses the full model gene order instead.
+Its final layer outputs raw scores, so compile it with a loss that expects
+logits when doing classification.
 
 ## Autoregressive cell generation
 
 ```python
-generated = model.generate_cells(
+generated = scu_model.generate_cells(
     n_cells=128,
     sampling_depth=1_024,
     batch_size=128,
@@ -167,7 +199,7 @@ returned row contains exactly `sampling_depth` UMIs.
 ## Enriched AnnData
 
 ```python
-enriched = model.get_fully_enriched_h5ad(
+enriched = result.get_fully_enriched_h5ad(
     batch_size=256,
     list_of_genes=["CD4", "CD8A"],
     n_embedding_features=512,
@@ -178,7 +210,7 @@ The result contains:
 
 - Imputed log10(CPM) in `.X`.
 - PCA cell embeddings in `.obsm["X_scunveil"]`.
-- Output-decoder gene embeddings in
+- Shared input/output gene embeddings in
   `.varm["scunveil_gene_embeddings"]`.
 
 Omit `list_of_genes` to include all model genes. Omit
