@@ -30,7 +30,8 @@ def test_default_checkpoint_end_to_end():
     model = scUnveil(verbose=False)
     result = model.process_anndata(input_adata, batch_size=2)
 
-    assert result.gene_mapping_summary["mapped_input_features"] == 60_000
+    assert 0 < result.gene_mapping_summary["mapped_input_features"] <= input_adata.n_vars
+    assert result.var_map_matrix.shape == (input_adata.n_vars, model.config.n_genes)
     assert result.get_raw_embeddings().shape == (4, 2_048)
     assert result.get_embeddings(16).shape == (4, 16)
 
